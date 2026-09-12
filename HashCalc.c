@@ -14,6 +14,7 @@
 #include "UnicodeHelpers.h"
 #include "libs/WinHash.h"
 #include <Strsafe.h>
+#include <stdlib.h>
 
 
 // Due to the stupidity of the x64 compiler, the code emitted for the non-inline
@@ -493,6 +494,115 @@ BOOL WINAPI HashCalcWriteResult( PHASHCALCCONTEXT phcctx, PHASHCALCITEM pItem )
 	else return(FALSE);
 
 	return(bRetval);
+}
+
+// Append a "; selfcheck=<hash>" comment line to the file, in the file's
+// save encoding. The hash is ASCII so UTF-8 and ANSI output are identical.
+static BOOL WINAPI HashCalcWriteSelfCheckLine( PHASHCALCCONTEXT phcctx, PCTSTR pszHash )
+{
+	TCHAR szLine[MAX_DIGEST_STRING_LENGTH + 16];
+#ifndef UNICODE
+	WCHAR szW[MAX_DIGEST_STRING_LENGTH + 16];
+#endif
+	CHAR  szA[(MAX_DIGEST_STRING_LENGTH + 16) * 3];
+	PVOID pvLine;
+	size_t cbLine;
+
+	StringCchPrintf(szLine, countof(szLine), TEXT("; selfcheck=%s\r\n"), pszHash);
+
+	switch (phcctx->opt.dwSaveEncoding)
+	{
+		case 1: // UTF-16
+			cbLine = SSLen(szLine) * sizeof(TCHAR);
+			pvLine = szLine;
+			break;
+
+		case 2: // ANSI
+#ifdef UNICODE
+			cbLine = WStrToAStr(szLine, szA, countof(szA)) - 1;
+#else
+			cbLine = SSLen(szLine);
+			memcpy(szA, szLine, cbLine);
+#endif
+			pvLine = szA;
+			break;
+
+		default: // UTF-8
+#ifdef UNICODE
+			cbLine = WStrToUTF8(szLine, szA, countof(szA)) - 1;
+#else
+			cbLine = AStrToWStr(szLine, szW, countof(szW)) - 1;
+			cbLine = WStrToUTF8(szW, szA, countof(szA)) - 1;
+#endif
+			pvLine = szA;
+			break;
+	}
+
+	if (cbLine == 0)
+		return(FALSE);
+
+	{
+		DWORD cbWritten;
+		return(WriteFile(phcctx->hFileOut, pvLine, (DWORD)cbLine, &cbWritten, NULL) &&
+		       cbWritten == (DWORD)cbLine);
+	}
+}
+
+// Self-check the checksum file we just wrote: re-read its raw contents, decode
+// and normalize them exactly as the verifier will, hash that content with the
+// same algorithm as the file, and append the "; selfcheck=<hash>" line.
+VOID WINAPI HashCalcAppendSelfCheck( PHASHCALCCONTEXT phcctx )
+{
+	HANDLE hFile;
+	LARGE_INTEGER cbSize;
+	DWORD cbLen, cbRead;
+	PBYTE pbData;
+	PWSTR pszW;
+	DWORD dwAlg;
+	TCHAR szHash[MAX_DIGEST_STRING_LENGTH];
+
+	if ((hFile = OpenFileForReading(phcctx->ofn.lpstrFile)) == INVALID_HANDLE_VALUE)
+		return;
+
+	if (!GetFileSizeEx(hFile, &cbSize) || cbSize.HighPart)
+	{
+		CloseHandle(hFile);
+		return;
+	}
+
+	cbLen = cbSize.LowPart;
+
+	if (!(pbData = (PBYTE)malloc(cbLen + sizeof(DWORD))))
+	{
+		CloseHandle(hFile);
+		return;
+	}
+
+	if (cbLen && (!ReadFile(hFile, pbData, cbLen, &cbRead, NULL) || cbRead != cbLen))
+	{
+		free(pbData);
+		CloseHandle(hFile);
+		return;
+	}
+
+	CloseHandle(hFile);
+
+	// Null-terminate the buffer for the decoder (mirrors HashVerifyLoadData)
+	*((UPDWORD)(pbData + cbLen)) = 0;
+
+	if (!(pszW = BufferToWStr(&pbData, cbLen)))
+	{
+		free(pbData);
+		return;
+	}
+
+	HCNormalizeString(pszW);
+
+	dwAlg = 1UL << (phcctx->ofn.nFilterIndex - 1);
+	if (HashCheckSelfHash(dwAlg, pszW, (UINT)(SSLen(pszW) * sizeof(TCHAR)), szHash))
+		HashCalcWriteSelfCheckLine(phcctx, szHash);
+
+	free(pbData);
 }
 
 VOID WINAPI HashCalcClearInvalid( PWHRESULTEX pwhres, WCHAR cInvalid )
